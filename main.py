@@ -4,6 +4,10 @@ Small always-on-top window. Extracts kanji tokens (context-aware compound
 readings via pykakasi), shows 漢字 -> ひらがな, and speaks each reading in
 Japanese using edge-tts (online) with a pyttsx3/SAPI Japanese voice as
 offline fallback. CPU-only.
+
+The global hotkey uses RegisterHotKey (MOD_NOREPEAT) on a dedicated
+message-pump thread; the selection is copied via an injected Ctrl+C whose
+success is verified through the clipboard sequence number.
 """
 
 import asyncio
@@ -17,16 +21,25 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+from ctypes import wintypes
 from tkinter import ttk
 
 import edge_tts
-import keyboard
 import pygame
 import pyttsx3
 from pykakasi import kakasi
 
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+user32.GetAsyncKeyState.restype = ctypes.c_short
+user32.VkKeyScanW.argtypes = [wintypes.WCHAR]
+user32.VkKeyScanW.restype = ctypes.c_short
+
 VOICE = "ja-JP-NanamiNeural"
-HOTKEY = "ctrl+h"  # press anywhere to copy selection -> paste -> speak
+# Pick a combo no common app uses: RegisterHotKey does not suppress the
+# keystroke, so it also reaches the focused app (ctrl+h opens History in
+# Chrome, Replace in Notepad/Word, etc.).
+HOTKEY = "ctrl+shift+x"  # press anywhere to copy selection -> paste -> speak
 
 
 def config_path():
@@ -38,7 +51,6 @@ def config_path():
     return os.path.join(base, "config.json")
 
 
-CAPTURE_MODS = ("ctrl", "alt", "shift")
 SAFE_BARE_KEYS = {
     "insert", "delete", "home", "end", "page up", "page down",
     "print screen", "scroll lock", "pause", "caps lock",
@@ -47,6 +59,160 @@ SAFE_BARE_KEYS = {
 
 def ok_bare_key(name):
     return bool(re.fullmatch(r"f([1-9]|1\d|2[0-4])", name)) or name in SAFE_BARE_KEYS
+
+
+# ---- global hotkey (RegisterHotKey on a dedicated thread) ----
+
+MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN = 0x1, 0x2, 0x4, 0x8
+MOD_NOREPEAT = 0x4000
+WM_HOTKEY = 0x0312
+WM_REREGISTER = 0x8001  # WM_APP + 1, private message to the hotkey thread
+
+MOD_BY_NAME = {
+    "ctrl": MOD_CONTROL, "control": MOD_CONTROL,
+    "left ctrl": MOD_CONTROL, "right ctrl": MOD_CONTROL,
+    "shift": MOD_SHIFT, "left shift": MOD_SHIFT, "right shift": MOD_SHIFT,
+    "alt": MOD_ALT, "menu": MOD_ALT, "left alt": MOD_ALT, "right alt": MOD_ALT,
+    "win": MOD_WIN, "windows": MOD_WIN,
+    "left windows": MOD_WIN, "right windows": MOD_WIN,
+}
+
+NAMED_VKS = {
+    "backspace": 0x08, "tab": 0x09, "enter": 0x0D, "return": 0x0D,
+    "esc": 0x1B, "escape": 0x1B, "space": 0x20, "spacebar": 0x20,
+    "page up": 0x21, "prior": 0x21, "page down": 0x22, "next": 0x22,
+    "end": 0x23, "home": 0x24, "left": 0x25, "up": 0x26,
+    "right": 0x27, "down": 0x28, "insert": 0x2D, "delete": 0x2E,
+    "print screen": 0x2C, "print": 0x2C, "num lock": 0x90,
+    "scroll lock": 0x91, "caps lock": 0x14, "pause": 0x13, "break": 0x13,
+    "apps": 0x5D, "menu key": 0x5D,
+}
+for _i in range(1, 25):
+    NAMED_VKS[f"f{_i}"] = 0x6F + _i
+for _i in range(10):
+    NAMED_VKS[f"keypad {_i}"] = 0x60 + _i
+NAMED_VKS.update({
+    "keypad decimal": 0x6E, "keypad add": 0x6B, "keypad subtract": 0x6D,
+    "keypad multiply": 0x6A, "keypad divide": 0x6F,
+})
+
+_KP_OPS = {
+    "decimal": "keypad decimal", "separator": "keypad decimal",
+    "add": "keypad add", "subtract": "keypad subtract",
+    "multiply": "keypad multiply", "divide": "keypad divide",
+}
+
+
+def parse_hotkey(text):
+    """'ctrl+shift+x' -> (mods | MOD_NOREPEAT, vk), or None if invalid."""
+    parts = [p.strip().lower() for p in text.split("+") if p.strip()]
+    if not parts:
+        return None
+    mods = 0
+    for p in parts[:-1]:
+        m = MOD_BY_NAME.get(p)
+        if m is None:
+            return None
+        mods |= m
+    key = parts[-1]
+    if key in MOD_BY_NAME:
+        return None  # combo must end with a real key, not a modifier
+    if key in NAMED_VKS:
+        vk = NAMED_VKS[key]
+    elif len(key) == 1:
+        r = user32.VkKeyScanW(key)
+        if r == -1 or (r & 0xFF) == 0xFF:
+            return None
+        vk = r & 0xFF
+        shift_state = (r >> 8) & 0xFF
+        if shift_state & 1:
+            mods |= MOD_SHIFT
+        if shift_state & 2:
+            mods |= MOD_CONTROL
+        if shift_state & 4:
+            mods |= MOD_ALT
+    else:
+        return None
+    return mods | MOD_NOREPEAT, vk
+
+
+class HotkeyThread(threading.Thread):
+    """Owns the RegisterHotKey registration and pumps WM_HOTKEY messages."""
+
+    HOTKEY_ID = 1
+
+    def __init__(self, app):
+        super().__init__(daemon=True)
+        self.app = app
+        self.tid = None
+        self.ready = threading.Event()
+        self.registered = False
+
+    def run(self):
+        msg = wintypes.MSG()
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)  # create queue
+        self.tid = kernel32.GetCurrentThreadId()
+        self._register()
+        self.ready.set()
+        while True:
+            r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if r <= 0:
+                return
+            if msg.message == WM_HOTKEY:
+                self.app.on_hotkey()
+            elif msg.message == WM_REREGISTER:
+                self._register()
+            else:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _register(self):
+        if self.registered:
+            user32.UnregisterHotKey(None, self.HOTKEY_ID)
+            self.registered = False
+        parsed = parse_hotkey(self.app.hotkey)
+        if parsed is None:
+            self.app.hk_error = f"Invalid hotkey: '{self.app.hotkey}'"
+            self.app.set_status(self.app.hk_error)
+            return
+        mods, vk = parsed
+        if user32.RegisterHotKey(None, self.HOTKEY_ID, mods, vk):
+            self.registered = True
+            self.app.hk_error = None
+            if self.app.kk_ready.is_set():
+                self.app.set_status(
+                    f"Ready - paste text, or select text anywhere + "
+                    f"{self.app.hotkey.upper()}"
+                )
+        else:
+            self.app.hk_error = (
+                f"Cannot register '{self.app.hotkey}' "
+                "(used by another app, or reserved)"
+            )
+            self.app.set_status(self.app.hk_error)
+
+    def retarget(self):
+        """Ask the hotkey thread to re-register the current hotkey."""
+        self.ready.wait()
+        if self.tid is not None:
+            user32.PostThreadMessageW(self.tid, WM_REREGISTER, 0, 0)
+
+
+def send_copy_keystroke():
+    """Inject Ctrl+C into the focused app.
+
+    The user usually still holds the hotkey's modifiers when this runs, so
+    the held modifiers are released first (otherwise the app would see e.g.
+    Ctrl+Shift+C) and re-pressed afterwards.
+    """
+    MOD_VKS = (0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0x5B, 0x5C, 0xA5)
+    held = [vk for vk in MOD_VKS if user32.GetAsyncKeyState(vk) & 0x8000]
+    for vk in held:
+        user32.keybd_event(vk, 0, 2, 0)
+    for vk, flags in ((0x11, 0), (0x43, 0), (0x43, 2), (0x11, 2)):
+        user32.keybd_event(vk, 0, flags, 0)
+    for vk in held:
+        user32.keybd_event(vk, 0, 0, 0)
 
 BG = "#23272e"
 PANEL = "#2c313a"
@@ -127,7 +293,7 @@ class App:
         self.tokens = []
         self.full_text = ""
         self.hotkey = self._load_config()
-        self._hook = None
+        self.hk_error = None
 
         root.title("Kanji Speaker")
         root.geometry("340x360")
@@ -171,9 +337,8 @@ class App:
         self.hk_entry = ttk.Entry(hk_box, width=10, textvariable=self.hotkey_var, justify="center")
         self.hk_entry.pack(side="right")
         self.capturing = False
-        self._cap = None
         self.hk_entry.bind("<FocusIn>", self._hotkey_focusin)
-        self.hk_entry.bind("<KeyPress>", lambda e: "break")
+        self.hk_entry.bind("<KeyPress>", self._entry_keypress)
         self.hk_entry.bind("<FocusOut>", self._hotkey_focusout)
 
         self.input = tk.Text(
@@ -228,6 +393,8 @@ class App:
 
         threading.Thread(target=self._load_kakasi, daemon=True).start()
 
+        self.hk_thread = HotkeyThread(self)
+        self.hk_thread.start()
         self.apply_hotkey()
 
     # ---- background helpers ----
@@ -235,7 +402,8 @@ class App:
     def _load_config(self):
         try:
             with open(config_path(), "r", encoding="utf-8") as f:
-                return json.load(f).get("hotkey", HOTKEY)
+                hotkey = json.load(f).get("hotkey", HOTKEY)
+            return hotkey if parse_hotkey(hotkey) else HOTKEY
         except Exception:
             return HOTKEY
 
@@ -246,47 +414,60 @@ class App:
         except Exception:
             pass
 
+    # Modifier-only keysyms: ignored while capturing (we wait for a real key).
+    _MOD_KEYSYMS = {
+        "shift_l", "shift_r", "control_l", "control_r", "alt_l", "alt_r",
+        "meta_l", "meta_r", "super_l", "super_r", "hyper_l", "hyper_r",
+        "iso_level3_shift", "mode_switch",
+    }
+    # Tk keysym -> hotkey name, where they differ.
+    _KEYSYM_NAMES = {
+        "prior": "page up", "next": "page down", "print": "print screen",
+        "scroll_lock": "scroll lock", "caps_lock": "caps lock",
+        "num_lock": "num lock", "return": "enter", "backspace": "backspace",
+    }
+    # Modifier VK codes for capture. event.state is unreliable on Windows Tk
+    # (Mod1Mask is set whenever Ctrl is held), so read physical state instead.
+    _STATE_MODS = (
+        ("ctrl", 0x11), ("alt", 0x12), ("shift", 0x10),
+        ("win", 0x5B), ("win", 0x5C),
+    )
+
     def _hotkey_focusin(self, _event):
-        # Enter capture mode: unregister the global hook so pressing a combo
-        # here can't trigger copy/paste, then watch physical keys via the
-        # same 'keyboard' lib that will register the hotkey.
+        # Enter capture mode. The entry sees the keys directly, so no global
+        # hook is needed; on_hotkey ignores fires while self.capturing.
         self.capturing = True
-        if self._hook is not None:
-            try:
-                keyboard.remove_hotkey(self._hook)
-            except Exception:
-                pass
-            self._hook = None
         self.hotkey_var.set("press keys...")
         self.set_status("Press a key combo (Esc to cancel)")
-        self._cap = keyboard.on_press(self._cap_press, suppress=False)
 
-    def _cap_press(self, event):
-        name = (event.name or "").lower()
-        if name in CAPTURE_MODS or "shift" in name or "ctrl" in name \
-                or "alt" in name or "windows" in name or "menu" in name:
-            return
-        parts = [m for m in CAPTURE_MODS if keyboard.is_pressed(m)]
-        if name == "esc":
+    def _entry_keypress(self, event):
+        """Entry is display-only; while capturing, a keypress sets the hotkey."""
+        if not self.capturing:
+            return "break"
+        name = (event.keysym or "").lower()
+        if name in self._MOD_KEYSYMS:
+            return "break"
+        if name.startswith("kp_"):
+            suffix = name[3:]
+            name = f"keypad {suffix}" if suffix.isdigit() else \
+                _KP_OPS.get(suffix, self._KEYSYM_NAMES.get(suffix, suffix))
+        else:
+            name = self._KEYSYM_NAMES.get(name, name)
+        mods = []
+        for m, vk in self._STATE_MODS:
+            if user32.GetAsyncKeyState(vk) & 0x8000 and m not in mods:
+                mods.append(m)
+        if name == "escape":
             result = None
-        elif not parts and not ok_bare_key(name):
+        elif not mods and not ok_bare_key(name):
             result = "bare"
         else:
-            parts.append(name)
-            result = "+".join(parts)
-        self.root.after(0, lambda: self._cap_done(result))
-
-    def _end_capture(self):
-        self.capturing = False
-        cap, self._cap = self._cap, None
-        if cap is not None:
-            try:
-                keyboard.unhook(cap)
-            except Exception:
-                pass
+            result = "+".join(mods + [name])
+        self._cap_done(result)
+        return "break"
 
     def _cap_done(self, result):
-        self._end_capture()
+        self.capturing = False
         if result == "bare":
             self.set_status(
                 "Add a modifier (ctrl/alt/shift), or use F1-F12 / Insert etc."
@@ -297,38 +478,33 @@ class App:
         self.root.focus_set()
 
     def _hotkey_focusout(self, _event):
-        was_capturing = self.capturing
-        self._end_capture()
-        if was_capturing:
+        if self.capturing:
+            self.capturing = False
             self.hotkey_var.set(self.hotkey)
-        self.apply_hotkey()
 
     def apply_hotkey(self):
         new = self.hotkey_var.get().strip().lower()
-        if not new or (new == getattr(self, "_applied", None) and self._hook is not None):
+        if not new or parse_hotkey(new) is None:
+            self.set_status(
+                f"Invalid hotkey: '{new}' (e.g. f9, ctrl+j, alt+shift+k)"
+            )
+            self.hotkey_var.set(self.hotkey)
             return
-        try:
-            hook = keyboard.add_hotkey(new, self.on_hotkey, suppress=True)
-        except Exception:
-            self.set_status(f"Invalid hotkey: '{new}' (e.g. f9, ctrl+j, alt+shift+k)")
-            self.hotkey_var.set(self._applied or HOTKEY)
-            return
-        if self._hook is not None:
-            try:
-                keyboard.remove_hotkey(self._hook)
-            except Exception:
-                pass
-        self._hook = hook
-        self._applied = new
-        self.hotkey = new
-        self._save_config()
-        if self.kk_ready.is_set():
-            self.set_status(f"Ready - paste text, or select text anywhere + {new.upper()}")
+        if new != self.hotkey:
+            self.hotkey = new
+            self._save_config()
+        self.hk_thread.retarget()
 
     def _load_kakasi(self):
         self.kk = kakasi()
         self.kk_ready.set()
-        self.set_status(f"Ready - paste text, or select text anywhere + {self.hotkey.upper()}")
+        if self.hk_error:
+            self.set_status(self.hk_error)
+        else:
+            self.set_status(
+                f"Ready - paste text, or select text anywhere + "
+                f"{self.hotkey.upper()}"
+            )
 
     def set_status(self, msg):
         self.root.after(0, lambda: self.status.config(text=msg))
@@ -345,20 +521,46 @@ class App:
     # ---- UI actions ----
 
     def on_hotkey(self):
-        # Called from keyboard's hook thread: copy the current selection in
-        # the focused app, then grab the clipboard on the UI thread.
+        # Called on the HotkeyThread when the global hotkey fires. Do the
+        # copy + clipboard verification off that thread so its message pump
+        # stays responsive.
         if self.capturing:
             return
-        try:
-            keyboard.send("ctrl+c")
-        except Exception:
+        threading.Thread(target=self._grab_selection, daemon=True).start()
+
+    def _grab_selection(self):
+        """Inject Ctrl+C and wait until the clipboard actually changes."""
+        seq0 = user32.GetClipboardSequenceNumber()
+        copied = False
+        for _attempt in range(3):
+            send_copy_keystroke()
+            deadline = time.time() + 0.5
+            while time.time() < deadline:
+                if user32.GetClipboardSequenceNumber() != seq0:
+                    copied = True
+                    break
+                time.sleep(0.02)
+            if copied:
+                break
+            time.sleep(0.05)
+        if not copied:
+            self.set_status(
+                "Copy failed - is that window elevated, or is text selected?"
+            )
             return
-        self.root.after(350, self._paste_clipboard)
+        self.root.after(30, self._paste_clipboard)
 
     def _paste_clipboard(self):
-        try:
-            text = self.root.clipboard_get()
-        except tk.TclError:
+        # Apps using delayed rendering (e.g. Office) flag the clipboard as
+        # changed before the data is actually available; retry briefly.
+        for _ in range(5):
+            try:
+                text = self.root.clipboard_get()
+                break
+            except tk.TclError:
+                text = None
+                time.sleep(0.04)
+        if text is None:
             return
         self.input.delete("1.0", "end")
         self.input.insert("1.0", text)
