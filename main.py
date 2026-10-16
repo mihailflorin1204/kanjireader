@@ -25,7 +25,7 @@ import pyttsx3
 from pykakasi import kakasi
 
 VOICE = "ja-JP-NanamiNeural"
-HOTKEY = "f9"  # press anywhere to copy selection -> paste -> speak
+HOTKEY = "ctrl+h"  # press anywhere to copy selection -> paste -> speak
 
 BG = "#23272e"
 PANEL = "#2c313a"
@@ -107,8 +107,8 @@ class App:
         self.full_text = ""
 
         root.title("Kanji Speaker")
-        root.geometry("430x360")
-        root.minsize(340, 280)
+        root.geometry("340x360")
+        root.minsize(280, 280)
         root.attributes("-topmost", True)
         root.configure(bg=BG)
 
@@ -157,11 +157,8 @@ class App:
 
         btns = ttk.Frame(root)
         btns.pack(fill="x", padx=10, pady=4)
-        ttk.Button(btns, text="Paste", command=self.paste).pack(side="left")
-        ttk.Button(
-            btns, text="Speak", style="Accent.TButton", command=self.speak
-        ).pack(side="left", padx=6)
-        ttk.Button(btns, text="Stop", command=self.stop).pack(side="left")
+        ttk.Button(btns, text="Paste", style="Accent.TButton", command=self.paste).pack(side="left")
+        ttk.Button(btns, text="Stop", command=self.stop).pack(side="left", padx=6)
 
         speed_row = ttk.Frame(root)
         speed_row.pack(fill="x", padx=10, pady=(0, 2))
