@@ -9,6 +9,7 @@ offline fallback. CPU-only.
 import asyncio
 import ctypes
 import io
+import json
 import os
 import re
 import sys
@@ -26,6 +27,26 @@ from pykakasi import kakasi
 
 VOICE = "ja-JP-NanamiNeural"
 HOTKEY = "ctrl+h"  # press anywhere to copy selection -> paste -> speak
+
+
+def config_path():
+    base = (
+        os.path.dirname(sys.executable)
+        if getattr(sys, "frozen", False)
+        else os.path.dirname(os.path.abspath(__file__))
+    )
+    return os.path.join(base, "config.json")
+
+
+CAPTURE_MODS = ("ctrl", "alt", "shift")
+SAFE_BARE_KEYS = {
+    "insert", "delete", "home", "end", "page up", "page down",
+    "print screen", "scroll lock", "pause", "caps lock",
+}
+
+
+def ok_bare_key(name):
+    return bool(re.fullmatch(r"f([1-9]|1\d|2[0-4])", name)) or name in SAFE_BARE_KEYS
 
 BG = "#23272e"
 PANEL = "#2c313a"
@@ -105,6 +126,8 @@ class App:
         self.worker = None
         self.tokens = []
         self.full_text = ""
+        self.hotkey = self._load_config()
+        self._hook = None
 
         root.title("Kanji Speaker")
         root.geometry("340x360")
@@ -141,10 +164,17 @@ class App:
         header = ttk.Frame(root)
         header.pack(fill="x", padx=10, pady=(8, 4))
         ttk.Label(header, text="Kanji Speaker", style="Title.TLabel").pack(side="left")
-        ttk.Label(
-            header, text=f"select text anywhere + {HOTKEY.upper()}",
-            style="Status.TLabel",
-        ).pack(side="right")
+        hk_box = ttk.Frame(header)
+        hk_box.pack(side="right")
+        ttk.Label(hk_box, text="Hotkey", style="Status.TLabel").pack(side="left", padx=(0, 4))
+        self.hotkey_var = tk.StringVar(value=self.hotkey)
+        self.hk_entry = ttk.Entry(hk_box, width=10, textvariable=self.hotkey_var, justify="center")
+        self.hk_entry.pack(side="right")
+        self.capturing = False
+        self._cap = None
+        self.hk_entry.bind("<FocusIn>", self._hotkey_focusin)
+        self.hk_entry.bind("<KeyPress>", lambda e: "break")
+        self.hk_entry.bind("<FocusOut>", self._hotkey_focusout)
 
         self.input = tk.Text(
             root, height=3, font=("Meiryo", 11), wrap="word",
@@ -198,17 +228,107 @@ class App:
 
         threading.Thread(target=self._load_kakasi, daemon=True).start()
 
+        self.apply_hotkey()
+
+    # ---- background helpers ----
+
+    def _load_config(self):
         try:
-            keyboard.add_hotkey(HOTKEY, self.on_hotkey)
+            with open(config_path(), "r", encoding="utf-8") as f:
+                return json.load(f).get("hotkey", HOTKEY)
+        except Exception:
+            return HOTKEY
+
+    def _save_config(self):
+        try:
+            with open(config_path(), "w", encoding="utf-8") as f:
+                json.dump({"hotkey": self.hotkey}, f)
         except Exception:
             pass
 
-    # ---- background helpers ----
+    def _hotkey_focusin(self, _event):
+        # Enter capture mode: unregister the global hook so pressing a combo
+        # here can't trigger copy/paste, then watch physical keys via the
+        # same 'keyboard' lib that will register the hotkey.
+        self.capturing = True
+        if self._hook is not None:
+            try:
+                keyboard.remove_hotkey(self._hook)
+            except Exception:
+                pass
+            self._hook = None
+        self.hotkey_var.set("press keys...")
+        self.set_status("Press a key combo (Esc to cancel)")
+        self._cap = keyboard.on_press(self._cap_press, suppress=False)
+
+    def _cap_press(self, event):
+        name = (event.name or "").lower()
+        if name in CAPTURE_MODS or "shift" in name or "ctrl" in name \
+                or "alt" in name or "windows" in name or "menu" in name:
+            return
+        parts = [m for m in CAPTURE_MODS if keyboard.is_pressed(m)]
+        if name == "esc":
+            result = None
+        elif not parts and not ok_bare_key(name):
+            result = "bare"
+        else:
+            parts.append(name)
+            result = "+".join(parts)
+        self.root.after(0, lambda: self._cap_done(result))
+
+    def _end_capture(self):
+        self.capturing = False
+        cap, self._cap = self._cap, None
+        if cap is not None:
+            try:
+                keyboard.unhook(cap)
+            except Exception:
+                pass
+
+    def _cap_done(self, result):
+        self._end_capture()
+        if result == "bare":
+            self.set_status(
+                "Add a modifier (ctrl/alt/shift), or use F1-F12 / Insert etc."
+            )
+            result = None
+        self.hotkey_var.set(result if result else self.hotkey)
+        self.apply_hotkey()
+        self.root.focus_set()
+
+    def _hotkey_focusout(self, _event):
+        was_capturing = self.capturing
+        self._end_capture()
+        if was_capturing:
+            self.hotkey_var.set(self.hotkey)
+        self.apply_hotkey()
+
+    def apply_hotkey(self):
+        new = self.hotkey_var.get().strip().lower()
+        if not new or (new == getattr(self, "_applied", None) and self._hook is not None):
+            return
+        try:
+            hook = keyboard.add_hotkey(new, self.on_hotkey, suppress=True)
+        except Exception:
+            self.set_status(f"Invalid hotkey: '{new}' (e.g. f9, ctrl+j, alt+shift+k)")
+            self.hotkey_var.set(self._applied or HOTKEY)
+            return
+        if self._hook is not None:
+            try:
+                keyboard.remove_hotkey(self._hook)
+            except Exception:
+                pass
+        self._hook = hook
+        self._applied = new
+        self.hotkey = new
+        self._save_config()
+        if self.kk_ready.is_set():
+            self.set_status(f"Ready - paste text, or select text anywhere + {new.upper()}")
 
     def _load_kakasi(self):
         self.kk = kakasi()
         self.kk_ready.set()
-        self.set_status(f"Ready - paste text, or select text anywhere + {HOTKEY.upper()}")
+        self.set_status(f"Ready - paste text, or select text anywhere + {self.hotkey.upper()}")
 
     def set_status(self, msg):
         self.root.after(0, lambda: self.status.config(text=msg))
@@ -227,6 +347,8 @@ class App:
     def on_hotkey(self):
         # Called from keyboard's hook thread: copy the current selection in
         # the focused app, then grab the clipboard on the UI thread.
+        if self.capturing:
+            return
         try:
             keyboard.send("ctrl+c")
         except Exception:
