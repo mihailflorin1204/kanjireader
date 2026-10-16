@@ -1,0 +1,5 @@
+pykakasi==2.3.0
+edge-tts==7.3.1
+pygame==2.6.1
+pyttsx3==2.99
+keyboard==0.13.5
